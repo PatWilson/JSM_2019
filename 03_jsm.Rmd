@@ -1,0 +1,194 @@
+---
+title: "Implementation Science & Bayes (JSM)"
+author: "Patrick Wilson MPH"
+date: "July 23, 2019"
+output: html_document
+---
+
+
+```{r}
+library(brms)
+library(sjstats)
+library(mediation)
+library(tidyverse)
+```
+
+## Stepped Wedge Trial: JAGS model
+
+```{r}
+################
+## JAGS Model ##
+################
+poisson_wedge <- "
+model {
+for(i in 1:N){
+y[i] ~ dpois(lambda[i])
+log(lambda[i]) <- mu[i]
+mu[i] <- beta*treatment[i] + theta.clust[CID[i]] + u[TID[i]] + 1 * logoffset[i]
+}
+
+# random effects distributions (note: non-centered)
+for (j in 1:Nprim) {
+theta.clust[j] ~ dnorm(alpha, tau.clust)
+RE.clust[j] <- theta.clust[j]-alpha
+}
+
+u[1] ~ dnorm(0, tau.time)
+for (t in 2:Ntime){ u[t] ~ dnorm(rho * u[t - 1], tau.time)}
+
+
+# priors on regression coefficients and variances
+tau.clust ~ dgamma(1, 1) # between cluster variance
+tau.time ~ dgamma(1, 0.05)  # time series variance
+
+sigma2.clust <- 1/tau.clust
+sigma2.time <- 1/tau.time
+
+rho ~ dunif(0,1)  #Some AR(1) parameter 
+
+alpha ~ dnorm (0, 0.0001) # Intercept
+beta ~ dnorm (0, 0.0001 ) # Treatment
+}"
+```
+
+
+## Mediation Example
+```{r, cache=TRUE}
+#Original code from https://m-clark.github.io/posts/2019-03-12-mediation-models/
+data(jobs)
+
+model_mediator <- bf(job_seek ~ treat + econ_hard + sex + age)
+model_outcome  <- bf(depress2 ~ treat + job_seek + econ_hard + sex + age)
+
+med_result = brm(model_mediator + model_outcome + set_rescor(FALSE), 
+                 data = jobs, 
+                 cores=1)
+
+summary(med_result)
+print(sjstats::mediation(med_result), digits=4)  
+
+#Make stancode
+#mediation
+make_stancode(model_mediator + model_outcome + set_rescor(FALSE), 
+                 data = jobs)
+
+#What changes if set_rescor(TRUE) 
+make_stancode(model_mediator + model_outcome + set_rescor(TRUE), 
+                                data = jobs)
+```
+
+## Post Processing & Interaction
+
+### Data generating function
+```{r}
+#Simple example of post processing power
+set.seed(5563395)
+N <-3000
+
+id <- seq(1:N)
+exposure <- rbinom(N, 1, 0.3)
+covariate <-rbinom(N, 1, 0.5)
+
+outcome_rare <- ifelse(exposure == 1 & covariate ==1, 
+                        rbinom (N, 1, .075), 
+                        ifelse(exposure == 1 & covariate ==0, 
+                        rbinom (N, 1, .030),
+                        ifelse(exposure == 0 & covariate ==1, 
+                        rbinom (N, 1, .020),
+                        rbinom (N, 1, .010))))
+
+outcome_common <- ifelse(exposure == 1 & covariate ==1, 
+                          rbinom (N, 1, .75), 
+                          ifelse(exposure == 1 & covariate ==0, 
+                          rbinom (N, 1, .30),
+                          ifelse(exposure == 0 & covariate ==1, 
+                          rbinom (N, 1, .20),
+                          rbinom (N, 1, .10))))
+
+risk_data <- tibble(id, exposure, outcome_rare, outcome_common, covariate)
+```
+
+### BRMS models and underlying Stan code
+
+```{r, cache=TRUE}
+
+logistic_common <- brm(outcome_common ~ exposure*covariate, data = risk_data, 
+                family = bernoulli(),
+                iter = 2000)
+
+
+make_stancode(outcome_common ~ exposure*covariate, data = risk_data)
+
+```
+
+
+### Create estimates of interest
+
+```{r}
+
+newdata <- risk_data[1:1000,]
+
+
+newdata$exposure <-1
+pr_1 <- posterior_linpred(logistic_common, newdata = newdata, transform = TRUE)
+
+newdata$exposure <-0
+pr_0 <- posterior_linpred(logistic_common, newdata = newdata, transform = TRUE)
+
+newdata$exposure <-1
+newdata$covariate<-1
+pr_11 <- posterior_linpred(logistic_common, newdata = newdata, transform = TRUE)
+
+newdata$exposure <-1
+newdata$covariate<-0
+pr_10 <-  posterior_linpred(logistic_common, newdata = newdata, transform = TRUE)
+
+newdata$exposure <-0
+newdata$covariate<-1
+pr_01 <- posterior_linpred(logistic_common, newdata = newdata, transform = TRUE)
+
+newdata$exposure <-0
+newdata$covariate<-0
+pr_00 <- posterior_linpred(logistic_common, newdata = newdata, transform = TRUE)
+
+#estimates of interest
+risk_diff <- pr_1 - pr_0
+RR <- pr_1 / pr_0
+
+odds_1 <- pr_1/(1-pr_1)
+odds_0 <- pr_0/(1-pr_0)
+
+OR <- odds_1/odds_0
+
+#test of interaction on the additive scale
+interaction <- pr_11 - pr_10 - pr_01 + pr_00
+```
+
+
+
+### Get summaries
+```{r}
+
+summary(logistic_common)
+
+print("Risk Difference")
+summary(c(risk_diff))
+print("Relative Risk")
+summary(c(RR))
+print("Odds Ratio")
+summary(c(OR))
+print("Interaction on additive scale")
+summary(c(interaction))
+
+```
+
+
+
+
+### Session info
+```{r}
+sessionInfo()
+```
+
+
+
